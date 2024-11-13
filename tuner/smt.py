@@ -367,6 +367,7 @@ def mark_only_smt_as_trainable(model, select_parameters, select_attention_parame
 
 
 
+
 class LinearLayer_MatrixSparsity(torch.nn.Module):
     # an simple implementation of matrix sparsity
     # for now only support Linear Layer
@@ -401,6 +402,83 @@ class LinearLayer_MatrixSparsity(torch.nn.Module):
 
         x = self.fn(x,  self.selected_weight, self.index_list, self.weight)
         return x
+
+
+
+class LinearLayer_MatrixSparsity_extra_module(torch.nn.Module):
+    # an simple implementation of matrix sparsity
+    # for now only support Linear Layer
+    # This Sparse Linear function will not change parameters in base model.
+    # It will maintain a module to store sparse parameters
+    # By doing this, user can retrieve the original base model anytime they want
+    def __init__(self,
+                 weight,
+                 bias=None,
+                 index_list = []):
+        super(LinearLayer_MatrixSparsity, self).__init__()
+        self.weight = weight
+        self.weight.requires_grad = False
+        self.bias = bias
+        self.index_list = index_list
+
+
+        self.selected_weight = torch.empty(len(index_list) * Block_dimension, Block_dimension,dtype=self.weight.data.dtype,
+                                  device=self.weight.data.device)
+
+        for i in range(len(index_list)):
+            index = index_list[i]
+            self.selected_weight[i * Block_dimension: i * Block_dimension + Block_dimension, :] = self.weight.data[index[0] * Block_dimension: index[0] * Block_dimension + Block_dimension, index[1] * Block_dimension: index[1] * Block_dimension + Block_dimension]
+        self.selected_weight.requires_grad = True
+        self.selected_weight = nn.Parameter(self.selected_weight)
+
+
+        self.fn = linearZ_extra_module.apply
+
+    def forward(self, x):
+        # Forward pass using selected_weight in addition to the unmodified weight
+        x = self.fn(x, self.selected_weight, self.index_list, self.weight)
+        return x
+
+
+
+
+class linearZ_extra_module(torch.autograd.Function):
+    # only support batch size D=3 now, for batch size = 1, need to add mm. operation.
+    @staticmethod
+    @staticmethod
+    def forward(ctx, input, selected_weight, matrix_index_list, weight):
+        # Compute the initial output using the original weight matrix
+        output = torch.matmul(input, weight.t())
+
+        # Update output by adding the contributions from selected_weight
+        for i, index in enumerate(matrix_index_list):
+            selected_block = selected_weight[i * Block_dimension: (i + 1) * Block_dimension, :]
+            input_block = input[:, :, index[1] * Block_dimension: (index[1] + 1) * Block_dimension]
+            output[:, :, index[0] * Block_dimension: (index[0] + 1) * Block_dimension] += \
+                torch.matmul(input_block, selected_block.t())
+
+        # Save selected_weight and matrix_index_list for backward pass
+        ctx.save_for_backward(selected_weight, weight)
+        ctx.matrix_index_list = matrix_index_list
+
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        selected_weight, weight = ctx.saved_tensors
+        matrix_index_list = ctx.matrix_index_list
+
+        # Compute gradients for selected_weight only
+        grad_selected_weight = torch.zeros_like(selected_weight)
+        input_list = [grad_output[:, :, index[0] * Block_dimension: (index[0] + 1) * Block_dimension]
+                      for index in matrix_index_list]
+
+        for i, index in enumerate(matrix_index_list):
+            grad_selected_weight[i * Block_dimension: (i + 1) * Block_dimension, :] = torch.sum(torch.matmul(grad_output.permute(0, 2, 1)[:, index[0] * Block_dimension:(index[0] + 1) * Block_dimension, :],input_list[i]), dim=0)
+
+        grad_input = torch.matmul(grad_output, selected_weight)
+
+        return grad_input, grad_selected_weight, None, None
 
 class linearZ(torch.autograd.Function):
     # only support batch size D=3 now, for batch size = 1, need to add mm. operation.
